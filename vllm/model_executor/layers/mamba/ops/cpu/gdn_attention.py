@@ -469,7 +469,6 @@ def _cpu_gdn_attention_spec_aware(
         conv_buf,
         ssm_state,
         width,
-        state_len,
     )
 
     # Process the (rare) non-spec subset (prefill) tokens, if any.
@@ -500,7 +499,6 @@ def _spec_forward(
     conv_buf: torch.Tensor,
     ssm_state: torch.Tensor,
     width: int,
-    state_len: int,
 ) -> torch.Tensor:
     """Run the GDN core for the multi-query (speculative) tokens.
 
@@ -567,11 +565,9 @@ def _spec_forward(
             if silu:
                 out = F.silu(out)
             conv_out[start : start + q_i] = out.transpose(0, 1).to(conv_out.dtype)
-            # Roll the buffer: drop the accepted history from the front, append
-            # the new draft tokens, keep total length == state_len.
-            keep = B[:, offset + 1 : offset + 1 + (state_len - q_i)]
-            new_B = torch.cat([keep, x_seq], dim=-1)
-            B.copy_(new_B)
+            # Roll the buffer: shift left by one over history + new tokens. Only
+            # the first width - 2 + q_i columns are meaningful for this q_i.
+            B[:, : conv_in.size(-1) - 1].copy_(conv_in[0, :, 1:])
 
     # ---- 2. Recurrent (multi-slot SSM state) ----
     # Single fused kernel call: it runs the recurrence over each sequence's
