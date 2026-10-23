@@ -18,6 +18,7 @@ from openai.types.responses import (
     ResponseStatus,
 )
 from openai.types.responses.response_output_text import Logprob, LogprobTopLogprob
+from openai_harmony import Message
 from pydantic import TypeAdapter
 
 from vllm import envs
@@ -254,10 +255,10 @@ class OpenAIServingResponses(GenerateBaseServing):
     def _validate_create_responses_input(
         self, request: ResponsesRequest
     ) -> ErrorResponse | None:
-        if self.use_harmony and request.is_include_output_logprobs():
+        if self.use_harmony and request.is_include_output_logprobs() and request.stream:
             return self.create_error_response(
                 err_type="invalid_request_error",
-                message="logprobs are not supported with gpt-oss models",
+                message="streaming logprobs are not supported with gpt-oss models",
                 status_code=HTTPStatus.BAD_REQUEST,
                 param="logprobs",
             )
@@ -805,6 +806,9 @@ class OpenAIServingResponses(GenerateBaseServing):
                     incomplete=(
                         i == len(harmony_msgs) - 1 and context.last_append_flush_status
                     ),
+                    logprobs=self._harmony_message_logprobs(
+                        request, context, msg, tokenizer
+                    ),
                 )
                 if next_streamed is not None and next_streamed[0] is msg:
                     reuse_streamed_item_ids(items, next_streamed[1])
@@ -969,6 +973,27 @@ class OpenAIServingResponses(GenerateBaseServing):
                 )
             )
         return out
+
+    def _harmony_message_logprobs(
+        self,
+        request: ResponsesRequest,
+        context: HarmonyContext,
+        message: Message,
+        tokenizer: TokenizerLike,
+    ) -> list[Logprob] | None:
+        """The output_text logprobs of a gpt-oss message, when requested."""
+        if not request.is_include_output_logprobs():
+            return None
+        collected = context.output_logprobs_for(message)
+        if collected is None:
+            return None
+        token_ids, logprobs = collected
+        return self._create_response_logprobs(
+            token_ids=token_ids,
+            logprobs=logprobs,
+            tokenizer=tokenizer,
+            top_logprobs=request.top_logprobs,
+        )
 
     def _create_response_logprobs(
         self,

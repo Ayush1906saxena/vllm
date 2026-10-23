@@ -81,6 +81,12 @@ class Segment(NamedTuple):
     recipient: str | None
     delta: str
     completed_message: Message | None = None
+    # Position of the token behind this segment in the chunk given to
+    # process_chunk, and whether that token is user-visible text (final or
+    # preamble content, not a Harmony control token). Lets callers line up
+    # per-token data such as logprobs with the message text it produced.
+    token_index: int | None = None
+    is_content_token: bool = False
 
 
 @dataclass
@@ -334,7 +340,7 @@ class HarmonyParser(DelegatingParser):
 
         segments: list[Segment] = []
         reasoning_token_count = 0
-        for token_id in token_ids:
+        for token_index, token_id in enumerate(token_ids):
             try:
                 self._harmony_parser.process(token_id)
             except HarmonyError:
@@ -360,6 +366,10 @@ class HarmonyParser(DelegatingParser):
                     recipient=recipient,
                     delta=delta,
                     completed_message=completed_message,
+                    token_index=token_index,
+                    is_content_token=self._is_content_token(
+                        token_id, channel, recipient
+                    ),
                 )
             )
 
@@ -396,6 +406,16 @@ class HarmonyParser(DelegatingParser):
             channel == "commentary" and recipient is not None
         )
         return is_reasoning_channel and not get_encoding().is_special_token(token_id)
+
+    @staticmethod
+    def _is_content_token(
+        token_id: int, channel: str | None, recipient: str | None
+    ) -> bool:
+        is_content_channel = (
+            _SegmentType.from_channel_and_recipient(channel, recipient)
+            == _SegmentType.CONTENT
+        )
+        return is_content_channel and not get_encoding().is_special_token(token_id)
 
     def adjust_request(
         self, request: ChatCompletionRequest | ResponsesRequest

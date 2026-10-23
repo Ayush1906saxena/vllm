@@ -13,7 +13,7 @@ from typing import Any
 import pytest
 import pytest_asyncio
 import requests
-from openai import NotFoundError, OpenAI
+from openai import BadRequestError, NotFoundError, OpenAI
 from openai_harmony import Message
 
 from tests.utils import RemoteOpenAIServer
@@ -172,6 +172,39 @@ async def test_max_tokens(client: OpenAI, model_name: str):
     assert response is not None
     assert response.status == "incomplete"
     assert response.incomplete_details.reason == "max_output_tokens"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model_name", [MODEL_NAME])
+async def test_output_logprobs(client: OpenAI, model_name: str):
+    """gpt-oss returns logprobs for the final answer's tokens only: they spell
+    out exactly the output_text, with no reasoning or control tokens."""
+    response = await client.responses.create(
+        model=model_name,
+        input="What is 13 * 24? Answer with just the number.",
+        reasoning={"effort": "low"},
+        include=["message.output_text.logprobs"],
+        top_logprobs=3,
+    )
+    assert response.status == "completed"
+    messages = [item for item in response.output if item.type == "message"]
+    assert messages
+    text = messages[-1].content[-1]
+    assert text.logprobs
+    assert "".join(lp.token for lp in text.logprobs) == text.text
+    assert all(len(lp.top_logprobs) == 3 for lp in text.logprobs)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model_name", [MODEL_NAME])
+async def test_streaming_output_logprobs_rejected(client: OpenAI, model_name: str):
+    with pytest.raises(BadRequestError):
+        await client.responses.create(
+            model=model_name,
+            input="What is 13 * 24?",
+            include=["message.output_text.logprobs"],
+            stream=True,
+        )
 
 
 @pytest.mark.asyncio

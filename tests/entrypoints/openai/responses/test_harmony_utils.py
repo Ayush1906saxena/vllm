@@ -10,6 +10,7 @@ from openai.types.responses import (
     ResponseReasoningItem,
 )
 from openai.types.responses.response_output_item import McpCall
+from openai.types.responses.response_output_text import Logprob
 from openai_harmony import Author, Message, Role, TextContent
 
 from vllm.entrypoints.openai.responses.harmony import (
@@ -318,6 +319,50 @@ class TestHarmonyToResponseOutput:
         assert len(output_items[0].content) == 2
         assert output_items[0].content[0].text == "Step 1: Analyze the request"
         assert output_items[0].content[1].text == "Step 2: Prepare to call functions"
+
+    def test_final_message_carries_logprobs(self):
+        """Logprobs collected for a final message land on its output_text."""
+        message = Message.from_role_and_content(Role.ASSISTANT, "Hi there")
+        message = message.with_channel("final")
+        logprobs = [
+            Logprob(token="Hi", logprob=-0.1, bytes=[72, 105], top_logprobs=[]),
+            Logprob(
+                token=" there",
+                logprob=-0.2,
+                bytes=list(b" there"),
+                top_logprobs=[],
+            ),
+        ]
+
+        output_items = harmony_to_response_output(
+            message, frozenset(), logprobs=logprobs
+        )
+
+        assert len(output_items) == 1
+        assert isinstance(output_items[0], ResponseOutputMessage)
+        assert output_items[0].content[0].logprobs == logprobs
+
+    def test_final_message_without_logprobs(self):
+        """Without collected logprobs, output_text.logprobs stays None."""
+        message = Message.from_role_and_content(Role.ASSISTANT, "Hi there")
+        message = message.with_channel("final")
+
+        output_items = harmony_to_response_output(message, frozenset())
+
+        assert output_items[0].content[0].logprobs is None
+
+    def test_reasoning_ignores_logprobs(self):
+        """Logprobs are only for user-visible text, never reasoning items."""
+        message = Message.from_role_and_content(Role.ASSISTANT, "Thinking...")
+        message = message.with_channel("analysis")
+        logprobs = [Logprob(token="Thinking", logprob=-0.3, bytes=[], top_logprobs=[])]
+
+        output_items = harmony_to_response_output(
+            message, frozenset(), logprobs=logprobs
+        )
+
+        assert len(output_items) == 1
+        assert output_items[0].type == "reasoning"
 
     def test_commentary_with_multiple_function_calls(self):
         """Test multiple function calls in commentary channel."""

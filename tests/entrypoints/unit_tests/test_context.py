@@ -11,6 +11,7 @@ from vllm.entrypoints.openai.responses.context import (
     SimpleContext,
     TurnMetrics,
 )
+from vllm.logprobs import Logprob
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.parser.harmony import ChunkResult, HarmonyParser, Segment
 
@@ -107,7 +108,7 @@ class FakeHarmonyParser(HarmonyParser):
 
 
 def make_harmony_context(
-    messages=None, available_tools=None, function_tool_names=None
+    messages=None, available_tools=None, function_tool_names=None, request=None
 ) -> tuple[HarmonyContext, FakeHarmonyParser]:
     fake_parser = FakeHarmonyParser()
     context = HarmonyContext(
@@ -115,6 +116,7 @@ def make_harmony_context(
         available_tools=[] if available_tools is None else available_tools,
         function_tool_names=function_tool_names,
         response_parser=fake_parser,
+        request=request,
     )
     return context, fake_parser
 
@@ -938,3 +940,131 @@ def test_simple_context_output_messages_no_mutation():
     assert len(msgs3) == 1
     assert msgs3[0].message == "hello world"
     assert msgs3[0].tokens == [1, 2]
+
+
+class _LogprobsRequest:
+    """The one request method HarmonyContext reads for output logprobs."""
+
+    def __init__(self, include_logprobs: bool):
+        self._include_logprobs = include_logprobs
+
+    def is_include_output_logprobs(self) -> bool:
+        return self._include_logprobs
+
+
+def _output_with_logprobs(token_ids, finished):
+    logprobs = [
+        {token_id: Logprob(logprob=-0.1 * (i + 1), rank=1, decoded_token=None)}
+        for i, token_id in enumerate(token_ids)
+    ]
+    return RequestOutput(
+        request_id="test-id",
+        prompt="Test prompt",
+        prompt_token_ids=[1, 2, 3],
+        prompt_logprobs=None,
+        outputs=[
+            CompletionOutput(
+                index=0,
+                text="",
+                token_ids=token_ids,
+                cumulative_logprob=0.0,
+                logprobs=logprobs,
+                finish_reason="stop" if finished else None,
+                stop_reason=None,
+            )
+        ],
+        finished=finished,
+        num_cached_tokens=0,
+    )
+
+
+def _final_message(text):
+    return Message.from_role_and_content(Role.ASSISTANT, text).with_channel("final")
+
+
+def test_output_logprobs_cover_only_content_tokens():
+    """Only the final message's text tokens get logprobs: control tokens and
+    reasoning are skipped, so they line up with the output_text."""
+    context, parser = make_harmony_context(request=_LogprobsRequest(True))
+    reasoning = Message.from_role_and_content(Role.ASSISTANT, "think").with_channel(
+        "analysis"
+    )
+    final = _final_message("Hi there")
+    # Tokens: 10 reasoning text, 11 <|end|> (completes reasoning),
+    # 12 <|channel|>-style header token, 13 "Hi", 14 " there", 15 <|return|>.
+    parser.enqueue_chunk_result(
+        segments=[
+            Segment("analysis", None, "think", None, token_index=0),
+            Segment("analysis", None, "", reasoning, token_index=1),
+            Segment(None, None, "", None, token_index=2),
+            Segment("final", None, "Hi", None, 3, is_content_token=True),
+            Segment("final", None, " there", None, 4, is_content_token=True),
+        ]
+    )
+    parser.enqueue_flush_result([Segment("final", None, "", final)])
+
+    context.append_output(_output_with_logprobs([10, 11, 12, 13, 14, 15], True))
+
+    assert context.output_logprobs_for(reasoning) is None
+    collected = context.output_logprobs_for(final)
+    assert collected is not None
+    token_ids, logprobs = collected
+    assert token_ids == [13, 14]
+    assert [lp[t].logprob for t, lp in zip(token_ids, logprobs)] == pytest.approx(
+        [-0.4, -0.5]
+    )
+
+
+def test_output_logprobs_span_chunks():
+    """A message's text tokens can arrive over several engine outputs."""
+    context, parser = make_harmony_context(request=_LogprobsRequest(True))
+    final = _final_message("Hi there")
+    parser.enqueue_chunk_result(
+        segments=[Segment("final", None, "Hi", None, 0, is_content_token=True)]
+    )
+    parser.enqueue_chunk_result(
+        segments=[
+            Segment("final", None, " there", None, 0, is_content_token=True),
+            Segment("final", None, "", final, token_index=1),
+        ]
+    )
+
+    context.append_output(_output_with_logprobs([13], False))
+    context.append_output(_output_with_logprobs([14, 15], True))
+
+    token_ids, logprobs = context.output_logprobs_for(final)
+    assert token_ids == [13, 14]
+    assert len(logprobs) == 2
+
+
+def test_output_logprobs_not_collected_unless_requested():
+    context, parser = make_harmony_context(request=_LogprobsRequest(False))
+    final = _final_message("Hi")
+    parser.enqueue_chunk_result(
+        segments=[
+            Segment("final", None, "Hi", None, 0, is_content_token=True),
+            Segment("final", None, "", final, token_index=1),
+        ]
+    )
+
+    context.append_output(_output_with_logprobs([13, 15], True))
+
+    assert context.output_logprobs_for(final) is None
+
+
+def test_output_logprobs_missing_from_engine_output():
+    """Requested but absent from the engine output: nothing is attached."""
+    context, parser = make_harmony_context(request=_LogprobsRequest(True))
+    final = _final_message("Hi")
+    parser.enqueue_chunk_result(
+        segments=[
+            Segment("final", None, "Hi", None, 0, is_content_token=True),
+            Segment("final", None, "", final, token_index=1),
+        ]
+    )
+
+    context.append_output(
+        create_mock_request_output(prompt_token_ids=[1], output_token_ids=[13, 15])
+    )
+
+    assert context.output_logprobs_for(final) is None

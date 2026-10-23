@@ -37,6 +37,7 @@ from vllm.entrypoints.openai.responses.utils import (
 from vllm.entrypoints.serve.utils.tool_calls_utils import (
     maybe_filter_parallel_tool_calls,
 )
+from vllm.logprobs import LogprobsOnePosition
 from vllm.outputs import RequestOutput
 from vllm.parser.abstract_parser import Parser
 from vllm.renderers.chat_utils import (
@@ -667,6 +668,19 @@ class HarmonyContext(ConversationContext):
             tuple[Message, list[ResponseOutputItem]]
         ] = []
 
+        # Output logprobs for user-visible text, when the request asks for
+        # them: the token ids and sampled logprobs of each completed final or
+        # preamble message, keyed by id() of the message (see
+        # output_logprobs_for), and those of the message being generated.
+        self.want_output_logprobs = (
+            request is not None and request.is_include_output_logprobs()
+        )
+        self._logprobs_by_message: dict[
+            int, tuple[Message, list[int], list[LogprobsOnePosition]]
+        ] = {}
+        self._pending_token_ids: list[int] = []
+        self._pending_logprobs: list[LogprobsOnePosition] = []
+
         # Turn tracking - replaces multiple individual tracking variables
         self.current_turn_metrics = TurnMetrics()
         # Track metrics for all turns
@@ -703,11 +717,52 @@ class HarmonyContext(ConversationContext):
             self.current_turn_metrics.reset()
 
         self.last_append_segments = segments
+        if self.want_output_logprobs:
+            self._track_output_logprobs(output, segments)
         self._messages.extend(
             segment.completed_message
             for segment in segments
             if segment.completed_message is not None
         )
+
+    def _track_output_logprobs(self, output: RequestOutput, segments: list) -> None:
+        """Collects the logprobs of content tokens and assigns them to the
+        message they complete. Harmony control tokens (<|channel|>, <|end|>,
+        ...) and reasoning or tool-call tokens are left out, so the logprobs
+        line up with the text of the output_text item."""
+        completion = output.outputs[0]
+        token_ids = completion.token_ids
+        sample_logprobs = completion.logprobs
+        for segment in segments:
+            index = segment.token_index
+            if (
+                segment.is_content_token
+                and index is not None
+                and sample_logprobs is not None
+                and index < len(sample_logprobs)
+            ):
+                self._pending_token_ids.append(token_ids[index])
+                self._pending_logprobs.append(sample_logprobs[index])
+            if segment.completed_message is not None:
+                if self._pending_token_ids:
+                    msg = segment.completed_message
+                    self._logprobs_by_message[id(msg)] = (
+                        msg,
+                        self._pending_token_ids,
+                        self._pending_logprobs,
+                    )
+                self._pending_token_ids = []
+                self._pending_logprobs = []
+
+    def output_logprobs_for(
+        self, message: Message
+    ) -> tuple[list[int], list[LogprobsOnePosition]] | None:
+        """The content token ids and their logprobs for a completed message,
+        or None when none were collected for it."""
+        entry = self._logprobs_by_message.get(id(message))
+        if entry is None or entry[0] is not message:
+            return None
+        return entry[1], entry[2]
 
     def append_tool_output(self, output: list[Message]) -> None:
         output_msgs = output
